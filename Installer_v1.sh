@@ -1441,6 +1441,7 @@ cat >"$APP_DIR/openconnect.php" <<'PHP'
 require __DIR__.'/config.php';
 require_login();
 
+/* Get Server IP */
 $serverIp = trim(shell_exec("curl -4 -fsSL https://api.ipify.org 2>/dev/null"));
 if(!$serverIp){
     $serverIp = $_SERVER['SERVER_ADDR'] ?? $_SERVER['HTTP_HOST'] ?? 'SERVER_IP';
@@ -1469,6 +1470,7 @@ function oc_cmd($cmd){
 }
 
 $msg=''; $err='';
+
 if($_SERVER['REQUEST_METHOD']==='POST'){
     $action=$_POST['action'] ?? '';
     $u=trim($_POST['username'] ?? '');
@@ -1485,7 +1487,8 @@ if(isset($_GET['delete'])){
     if($u!==''){
         oc_cmd('ocpasswd -d /etc/ocserv/ocpasswd '.escapeshellarg($u));
     }
-    header('Location: openconnect.php'); exit;
+    header('Location: openconnect.php');
+    exit;
 }
 
 $users=oc_users();
@@ -1506,15 +1509,17 @@ if($raw){
         }
     }
 }
+
 $activeCount=count($activeRows);
-$today=trim(shell_exec("journalctl -u ocserv --since today --no-pager 2>/dev/null | grep -E 'user connected|connected' | wc -l"));
+
+$today=trim(shell_exec("journalctl -u ocserv --since today --no-pager 2>/dev/null | grep -E 'connected' | wc -l"));
 if($today==='') $today='0';
 
 $logsRaw=shell_exec("journalctl -u ocserv -n 80 --no-pager 2>/dev/null");
 $logs=[];
 if($logsRaw){
     foreach(explode("\n",$logsRaw) as $line){
-        if(stripos($line,'connected')!==false || stripos($line,'disconnected')!==false || stripos($line,'authentication')!==false){
+        if(stripos($line,'connected')!==false || stripos($line,'disconnected')!==false){
             $logs[]=$line;
         }
     }
@@ -1523,25 +1528,143 @@ if($logsRaw){
 render_header('OpenConnect');
 ?>
 
+<style>
+.oc-premium-url-card{
+  margin-top:18px;
+  position:relative;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.14) !important;
+  background:
+    radial-gradient(circle at top left, rgba(34,197,94,.35), transparent 35%),
+    radial-gradient(circle at bottom right, rgba(59,130,246,.30), transparent 35%),
+    linear-gradient(135deg,#020617,#0f172a 55%,#111827) !important;
+  box-shadow:0 18px 45px rgba(2,6,23,.28);
+}
+
+.oc-premium-url-card:before{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:linear-gradient(120deg, transparent, rgba(255,255,255,.08), transparent);
+  transform:translateX(-100%);
+  animation:ocShine 4s infinite;
+}
+
+@keyframes ocShine{
+  0%{transform:translateX(-100%)}
+  55%{transform:translateX(100%)}
+  100%{transform:translateX(100%)}
+}
+
+.oc-url-content{
+  position:relative;
+  z-index:2;
+}
+
+.oc-url-title{
+  margin-bottom:6px;
+  color:#ffffff !important;
+  font-weight:900;
+}
+
+.oc-url-subtitle{
+  color:#cbd5e1;
+  font-size:13px;
+}
+
+.oc-url-row{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  margin-top:14px;
+}
+
+#ocUrlInput{
+  flex:1;
+  min-width:0;
+  padding:15px 16px;
+  border-radius:16px;
+  border:1px solid rgba(255,255,255,.18);
+  background:rgba(2,6,23,.78);
+  color:#ffffff;
+  font-size:16px;
+  font-weight:900;
+  letter-spacing:.3px;
+  outline:none;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.04);
+}
+
+.oc-copy-btn{
+  width:48px;
+  height:48px;
+  border:0;
+  border-radius:16px;
+  cursor:pointer;
+  background:linear-gradient(135deg,#22c55e,#16a34a);
+  color:white;
+  font-size:22px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  box-shadow:0 12px 28px rgba(34,197,94,.30);
+  transition:.2s;
+}
+
+.oc-copy-btn:hover{
+  transform:translateY(-2px);
+  box-shadow:0 16px 34px rgba(34,197,94,.42);
+}
+
+.oc-copy-msg{
+  display:none;
+  margin-top:10px;
+  color:#bbf7d0;
+  font-size:13px;
+  font-weight:800;
+}
+
+@media(max-width:600px){
+  .oc-url-row{
+    gap:8px;
+  }
+
+  #ocUrlInput{
+    font-size:14px;
+    padding:14px;
+  }
+
+  .oc-copy-btn{
+    width:44px;
+    height:44px;
+    border-radius:14px;
+    font-size:20px;
+  }
+}
+</style>
+
 <div class="grid">
   <div class="card"><div class="muted">OpenConnect max capacity</div><div class="kpi">100000</div></div>
-  <div class="card"><div class="muted">OpenConnect active now</div><div class="kpi"><?=esc($activeCount)?></div></div>
-  <div class="card"><div class="muted">OpenConnect total users</div><div class="kpi"><?=esc(count($users))?></div></div>
+  <div class="card"><div class="muted">Active now</div><div class="kpi"><?=esc($activeCount)?></div></div>
+  <div class="card"><div class="muted">Total users</div><div class="kpi"><?=esc(count($users))?></div></div>
   <div class="card"><div class="muted">Today connected</div><div class="kpi"><?=esc($today)?></div></div>
 </div>
 
-<div class="card" style="margin-top:18px">
-  <div class="toolbar" style="align-items:center">
-    <div>
-      <h2 class="section-title" style="margin-bottom:6px">OpenConnect URL</h2>
-      <div class="small">OpenConnect app-এ এই URL add করুন, তারপর username/password দিয়ে connect করুন।</div>
+<div class="card oc-premium-url-card">
+  <div class="oc-url-content">
+    <div class="toolbar" style="align-items:center">
+      <div>
+        <h2 class="section-title oc-url-title">OpenConnect URL</h2>
+        <div class="oc-url-subtitle">এই URL app-এ add করুন, তারপর username/password দিয়ে connect করুন।</div>
+      </div>
+      <span class="badge green">443</span>
     </div>
-    <span class="badge green">443</span>
-  </div>
-  <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
-    <input id="ocUrlInput" value="<?=esc($ocUrl)?>" readonly
-      style="flex:1;min-width:0;padding:14px;border-radius:16px;border:1px solid rgba(148,163,184,.25);background:#07111f;color:#e5e7eb;font-size:15px">
-    <button class="btn green" type="button" onclick="copyOpenConnectUrl()" style="white-space:nowrap">Copy</button>
+
+    <div class="oc-url-row">
+      <input id="ocUrlInput" value="<?=esc($ocUrl)?>" readonly>
+      <button class="oc-copy-btn" type="button" onclick="copyOpenConnectUrl()" title="Copy this URL">📋</button>
+    </div>
+
+    <div id="copyMsg" class="oc-copy-msg">✅ URL copied successfully!</div>
   </div>
 </div>
 
@@ -1549,16 +1672,31 @@ render_header('OpenConnect');
 function copyOpenConnectUrl(){
   const el = document.getElementById('ocUrlInput');
   const val = el.value;
+
   if(navigator.clipboard && window.isSecureContext){
-    navigator.clipboard.writeText(val).then(function(){ alert('Copied: ' + val); }).catch(function(){
-      el.select(); el.setSelectionRange(0, 99999); document.execCommand('copy'); alert('Copied: ' + val);
+    navigator.clipboard.writeText(val).then(function(){
+      showCopyMsg();
+    }).catch(function(){
+      fallbackCopyUrl(el);
     });
   } else {
-    el.select();
-    el.setSelectionRange(0, 99999);
-    document.execCommand('copy');
-    alert('Copied: ' + val);
+    fallbackCopyUrl(el);
   }
+}
+
+function fallbackCopyUrl(el){
+  el.select();
+  el.setSelectionRange(0, 99999);
+  document.execCommand('copy');
+  showCopyMsg();
+}
+
+function showCopyMsg(){
+  const msg = document.getElementById('copyMsg');
+  msg.style.display = 'block';
+  setTimeout(function(){
+    msg.style.display = 'none';
+  }, 1600);
 }
 </script>
 
@@ -1568,6 +1706,7 @@ function copyOpenConnectUrl(){
 <div class="card" style="margin-top:18px">
   <h2 class="section-title">OpenConnect users</h2>
   <div class="small">এই page-এর username/password দিয়েই OpenConnect login হবে।</div>
+
   <form method="post" style="margin-top:14px">
     <input type="hidden" name="action" value="add">
     <label>Username</label>
@@ -1602,6 +1741,7 @@ function copyOpenConnectUrl(){
     </div>
     <span class="badge green"><?=esc($activeCount)?> active</span>
   </div>
+
   <div class="table-wrap">
     <table style="min-width:720px">
       <tr><th>User</th><th>IP</th><th>VPN IP</th></tr>
