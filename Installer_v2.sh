@@ -1273,6 +1273,7 @@ udp-port = 443
 run-as-user = nobody
 run-as-group = daemon
 socket-file = /run/ocserv-socket
+occtl-socket-file = /run/occtl.socket
 server-cert = ${OC_SSL_DIR}/server-cert.pem
 server-key = ${OC_SSL_DIR}/server-key.pem
 max-clients = 100000
@@ -1420,54 +1421,6 @@ EOF
 chmod 440 /etc/sudoers.d/ovpn-oc-users
 visudo -cf /etc/sudoers.d/ovpn-oc-users >/dev/null
 
-# OpenConnect dynamic socket helper for live active sessions
-cat >/usr/local/bin/oc-active-sessions.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-find_sock() {
-  for p in /run/ocserv-socket /var/run/ocserv-socket /run/ocserv-socket.* /var/run/ocserv-socket.*; do
-    [[ -S "$p" ]] && { echo "$p"; return 0; }
-  done
-  return 1
-}
-
-SOCK="$(find_sock || true)"
-RAW=""
-if [[ -n "$SOCK" ]] && command -v occtl >/dev/null 2>&1; then
-  RAW="$(occtl -s "$SOCK" show sessions 2>/dev/null || occtl -s "$SOCK" show users 2>/dev/null || true)"
-fi
-
-if [[ -n "$RAW" ]]; then
-  echo "$RAW" | awk '
-  /^[[:space:]]*[0-9]+[[:space:]]+/ {
-    id=$1; user=$2; real=$3; vpn=$4;
-    if(user=="" || user=="Username" || user=="USER") next;
-    if(real=="") real="-";
-    if(vpn=="") vpn="-";
-    printf "%s\t%s\t%s\t%s\t%s\n", user,id,real,vpn,"live";
-    printed++;
-    next;
-  }'
-fi
-
-if [[ -z "$RAW" ]]; then
-  ss -Htn state established '( sport = :443 )' 2>/dev/null \
-    | awk '{print $5}' \
-    | sed 's/::ffff://g;s/^\[//;s/\]//;s/:.*$//' \
-    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    | sort -u \
-    | awk '{printf "unknown\t-\t%s\t-\tlive\n",$1}' || true
-fi
-SH
-chmod 755 /usr/local/bin/oc-active-sessions.sh
-
-cat >/etc/sudoers.d/ovpn-oc-active <<'SH'
-www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-active-sessions.sh
-SH
-chmod 440 /etc/sudoers.d/ovpn-oc-active
-visudo -cf /etc/sudoers.d/ovpn-oc-active >/dev/null
-
 # seed default OpenConnect user
 /usr/local/bin/oc-user-manage.sh add "${DEFAULT_USER}" "${DEFAULT_USER_PASS}" >/dev/null 2>&1 || true
 chown root:www-data "$OC_USERS_CSV" 2>/dev/null || true
@@ -1488,6 +1441,7 @@ cat >"$APP_DIR/openconnect.php" <<'PHP'
 require __DIR__.'/config.php';
 require_login();
 
+/* Get Server IP */
 $serverIp = trim(shell_exec("curl -4 -fsSL https://api.ipify.org 2>/dev/null"));
 if(!$serverIp){
     $serverIp = $_SERVER['SERVER_ADDR'] ?? $_SERVER['HTTP_HOST'] ?? 'SERVER_IP';
@@ -1516,6 +1470,7 @@ function oc_cmd($cmd){
 }
 
 $msg=''; $err='';
+
 if($_SERVER['REQUEST_METHOD']==='POST'){
     $action=$_POST['action'] ?? '';
     $u=trim($_POST['username'] ?? '');
@@ -1532,7 +1487,8 @@ if(isset($_GET['delete'])){
     if($u!==''){
         oc_cmd('ocpasswd -d /etc/ocserv/ocpasswd '.escapeshellarg($u));
     }
-    header('Location: openconnect.php'); exit;
+    header('Location: openconnect.php');
+    exit;
 }
 
 $users=oc_users();
@@ -1553,15 +1509,17 @@ if($raw){
         }
     }
 }
+
 $activeCount=count($activeRows);
-$today=trim(shell_exec("journalctl -u ocserv --since today --no-pager 2>/dev/null | grep -E 'user connected|connected' | wc -l"));
+
+$today=trim(shell_exec("journalctl -u ocserv --since today --no-pager 2>/dev/null | grep -E 'connected' | wc -l"));
 if($today==='') $today='0';
 
 $logsRaw=shell_exec("journalctl -u ocserv -n 80 --no-pager 2>/dev/null");
 $logs=[];
 if($logsRaw){
     foreach(explode("\n",$logsRaw) as $line){
-        if(stripos($line,'connected')!==false || stripos($line,'disconnected')!==false || stripos($line,'authentication')!==false){
+        if(stripos($line,'connected')!==false || stripos($line,'disconnected')!==false){
             $logs[]=$line;
         }
     }
@@ -1570,25 +1528,143 @@ if($logsRaw){
 render_header('OpenConnect');
 ?>
 
+<style>
+.oc-premium-url-card{
+  margin-top:18px;
+  position:relative;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.14) !important;
+  background:
+    radial-gradient(circle at top left, rgba(34,197,94,.35), transparent 35%),
+    radial-gradient(circle at bottom right, rgba(59,130,246,.30), transparent 35%),
+    linear-gradient(135deg,#020617,#0f172a 55%,#111827) !important;
+  box-shadow:0 18px 45px rgba(2,6,23,.28);
+}
+
+.oc-premium-url-card:before{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:linear-gradient(120deg, transparent, rgba(255,255,255,.08), transparent);
+  transform:translateX(-100%);
+  animation:ocShine 4s infinite;
+}
+
+@keyframes ocShine{
+  0%{transform:translateX(-100%)}
+  55%{transform:translateX(100%)}
+  100%{transform:translateX(100%)}
+}
+
+.oc-url-content{
+  position:relative;
+  z-index:2;
+}
+
+.oc-url-title{
+  margin-bottom:6px;
+  color:#ffffff !important;
+  font-weight:900;
+}
+
+.oc-url-subtitle{
+  color:#cbd5e1;
+  font-size:13px;
+}
+
+.oc-url-row{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  margin-top:14px;
+}
+
+#ocUrlInput{
+  flex:1;
+  min-width:0;
+  padding:15px 16px;
+  border-radius:16px;
+  border:1px solid rgba(255,255,255,.18);
+  background:rgba(2,6,23,.78);
+  color:#ffffff;
+  font-size:16px;
+  font-weight:900;
+  letter-spacing:.3px;
+  outline:none;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.04);
+}
+
+.oc-copy-btn{
+  width:48px;
+  height:48px;
+  border:0;
+  border-radius:16px;
+  cursor:pointer;
+  background:linear-gradient(135deg,#22c55e,#16a34a);
+  color:white;
+  font-size:22px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  box-shadow:0 12px 28px rgba(34,197,94,.30);
+  transition:.2s;
+}
+
+.oc-copy-btn:hover{
+  transform:translateY(-2px);
+  box-shadow:0 16px 34px rgba(34,197,94,.42);
+}
+
+.oc-copy-msg{
+  display:none;
+  margin-top:10px;
+  color:#bbf7d0;
+  font-size:13px;
+  font-weight:800;
+}
+
+@media(max-width:600px){
+  .oc-url-row{
+    gap:8px;
+  }
+
+  #ocUrlInput{
+    font-size:14px;
+    padding:14px;
+  }
+
+  .oc-copy-btn{
+    width:44px;
+    height:44px;
+    border-radius:14px;
+    font-size:20px;
+  }
+}
+</style>
+
 <div class="grid">
   <div class="card"><div class="muted">OpenConnect max capacity</div><div class="kpi">100000</div></div>
-  <div class="card"><div class="muted">OpenConnect active now</div><div class="kpi"><?=esc($activeCount)?></div></div>
-  <div class="card"><div class="muted">OpenConnect total users</div><div class="kpi"><?=esc(count($users))?></div></div>
+  <div class="card"><div class="muted">Active now</div><div class="kpi"><?=esc($activeCount)?></div></div>
+  <div class="card"><div class="muted">Total users</div><div class="kpi"><?=esc(count($users))?></div></div>
   <div class="card"><div class="muted">Today connected</div><div class="kpi"><?=esc($today)?></div></div>
 </div>
 
-<div class="card" style="margin-top:18px">
-  <div class="toolbar" style="align-items:center">
-    <div>
-      <h2 class="section-title" style="margin-bottom:6px">OpenConnect URL</h2>
-      <div class="small">OpenConnect app-এ এই URL add করুন, তারপর username/password দিয়ে connect করুন।</div>
+<div class="card oc-premium-url-card">
+  <div class="oc-url-content">
+    <div class="toolbar" style="align-items:center">
+      <div>
+        <h2 class="section-title oc-url-title">OpenConnect URL</h2>
+        <div class="oc-url-subtitle">এই URL app-এ add করুন, তারপর username/password দিয়ে connect করুন।</div>
+      </div>
+      <span class="badge green">443</span>
     </div>
-    <span class="badge green">443</span>
-  </div>
-  <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
-    <input id="ocUrlInput" value="<?=esc($ocUrl)?>" readonly
-      style="flex:1;min-width:0;padding:14px;border-radius:16px;border:1px solid rgba(148,163,184,.25);background:#07111f;color:#e5e7eb;font-size:15px">
-    <button class="btn green" type="button" onclick="copyOpenConnectUrl()" style="white-space:nowrap">Copy</button>
+
+    <div class="oc-url-row">
+      <input id="ocUrlInput" value="<?=esc($ocUrl)?>" readonly>
+      <button class="oc-copy-btn" type="button" onclick="copyOpenConnectUrl()" title="Copy this URL">📋</button>
+    </div>
+
+    <div id="copyMsg" class="oc-copy-msg">✅ URL copied successfully!</div>
   </div>
 </div>
 
@@ -1596,16 +1672,31 @@ render_header('OpenConnect');
 function copyOpenConnectUrl(){
   const el = document.getElementById('ocUrlInput');
   const val = el.value;
+
   if(navigator.clipboard && window.isSecureContext){
-    navigator.clipboard.writeText(val).then(function(){ alert('Copied: ' + val); }).catch(function(){
-      el.select(); el.setSelectionRange(0, 99999); document.execCommand('copy'); alert('Copied: ' + val);
+    navigator.clipboard.writeText(val).then(function(){
+      showCopyMsg();
+    }).catch(function(){
+      fallbackCopyUrl(el);
     });
   } else {
-    el.select();
-    el.setSelectionRange(0, 99999);
-    document.execCommand('copy');
-    alert('Copied: ' + val);
+    fallbackCopyUrl(el);
   }
+}
+
+function fallbackCopyUrl(el){
+  el.select();
+  el.setSelectionRange(0, 99999);
+  document.execCommand('copy');
+  showCopyMsg();
+}
+
+function showCopyMsg(){
+  const msg = document.getElementById('copyMsg');
+  msg.style.display = 'block';
+  setTimeout(function(){
+    msg.style.display = 'none';
+  }, 1600);
 }
 </script>
 
@@ -1615,6 +1706,7 @@ function copyOpenConnectUrl(){
 <div class="card" style="margin-top:18px">
   <h2 class="section-title">OpenConnect users</h2>
   <div class="small">এই page-এর username/password দিয়েই OpenConnect login হবে।</div>
+
   <form method="post" style="margin-top:14px">
     <input type="hidden" name="action" value="add">
     <label>Username</label>
@@ -1649,6 +1741,7 @@ function copyOpenConnectUrl(){
     </div>
     <span class="badge green"><?=esc($activeCount)?> active</span>
   </div>
+
   <div class="table-wrap">
     <table style="min-width:720px">
       <tr><th>User</th><th>IP</th><th>VPN IP</th></tr>
@@ -1982,10 +2075,6 @@ render_header('OpenConnect');
 EOP
 
 systemctl restart ocserv || true
-sleep 2
-echo "OpenConnect sockets:"
-ls -la /run/ocserv-socket* /var/run/ocserv-socket* 2>/dev/null || true
-sudo /usr/local/bin/oc-active-sessions.sh 2>/dev/null || true
 systemctl restart apache2 || true
 
 echo "Patched OpenConnect sessions page."
@@ -2097,28 +2186,28 @@ if [[ -f /etc/ocserv/ocserv.conf ]]; then
   grep -q '^disconnect-script = /usr/local/bin/oc-event-log.sh' /etc/ocserv/ocserv.conf || echo 'disconnect-script = /usr/local/bin/oc-event-log.sh' >> /etc/ocserv/ocserv.conf
 fi
 
-echo "[4/6] Rebuilding OpenConnect page with dynamic live counters..."
+echo "[4/6] Rebuilding OpenConnect page with verified counters..."
 cat > "$APP_DIR/openconnect.php" <<'PHP'
 <?php
 require __DIR__.'/config.php';
 require_login();
 
+function oc_users_csv_path(){ return __DIR__ . '/data/oc_users.csv'; }
 function oc_read_users(){
-    $f = __DIR__ . '/data/oc_users.csv';
+    $f = oc_users_csv_path();
     $rows = [];
     if (!is_file($f) || !is_readable($f)) return $rows;
-    foreach(file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line){
-        $parts = explode('|', trim($line));
+    $lines = file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach($lines as $line){
+        $parts = str_getcsv($line);
         if(count($parts) >= 2){
-            $rows[] = ['username'=>$parts[0], 'password'=>$parts[1], 'blocked'=>(int)($parts[2] ?? 0)];
+            $rows[] = ['username'=>$parts[0], 'password'=>$parts[1]];
         }
     }
     return $rows;
 }
-function oc_logs($limit=80){
-    $dbFile = __DIR__.'/data/oc_events.sqlite';
-    if(!is_file($dbFile)) return [];
-    $db = new SQLite3($dbFile);
+function oc_logs($limit=100){
+    $db = new SQLite3(__DIR__.'/data/oc_events.sqlite');
     $db->busyTimeout(3000);
     $res = $db->query('SELECT * FROM oc_events ORDER BY id DESC LIMIT '.(int)$limit);
     $rows = [];
@@ -2126,38 +2215,34 @@ function oc_logs($limit=80){
     return $rows;
 }
 function oc_active_sessions(){
-    $out = shell_exec('sudo /usr/local/bin/oc-active-sessions.sh 2>/dev/null');
+    $db = new SQLite3(__DIR__.'/data/oc_events.sqlite');
+    $db->busyTimeout(3000);
+    $sql = "SELECT e1.* FROM oc_events e1 INNER JOIN (SELECT username, MAX(id) AS max_id FROM oc_events WHERE COALESCE(username,'')<>'' GROUP BY username) latest ON latest.max_id=e1.id WHERE e1.event_type='connect' ORDER BY e1.id DESC";
+    $res = $db->query($sql);
     $rows = [];
-    if(!$out) return $rows;
-    foreach(explode("\n", trim($out)) as $line){
-        $p = explode("\t", trim($line));
-        if(count($p) < 3) continue;
-        $rows[] = [
-            'username'=>$p[0] ?? 'unknown',
-            'session_id'=>$p[1] ?? '-',
-            'real_ip'=>$p[2] ?? '-',
-            'vpn_ip'=>$p[3] ?? '-',
-            'connected_since'=>$p[4] ?? 'live'
-        ];
-    }
+    while($row = $res->fetchArray(SQLITE3_ASSOC)) $rows[] = $row;
     return $rows;
 }
 $msg=''; $err='';
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['add_user'])) {
     $u = trim($_POST['username'] ?? '');
     $p = trim($_POST['password'] ?? '');
-    if ($u === '' || $p === '') $err = 'Username and password required';
-    else {
+    if ($u === '' || $p === '') {
+        $err = 'Username and password required';
+    } else {
         exec('sudo /usr/local/bin/oc-user-manage.sh add '.escapeshellarg($u).' '.escapeshellarg($p).' 2>&1', $out, $code);
-        if ($code === 0) $msg = 'User added'; else $err = trim(implode("\n", $out)) ?: 'Failed';
+        if ($code === 0) $msg = 'User added';
+        else $err = trim(implode("\n", $out)) ?: 'Failed';
     }
 }
 if (isset($_GET['delete']) && $_GET['delete'] !== '') {
-    exec('sudo /usr/local/bin/oc-user-manage.sh delete '.escapeshellarg(trim($_GET['delete'])).' 2>&1', $out, $code);
-    header('Location: openconnect.php'); exit;
+    $u = trim($_GET['delete']);
+    exec('sudo /usr/local/bin/oc-user-manage.sh delete '.escapeshellarg($u).' 2>&1', $out, $code);
+    header('Location: openconnect.php');
+    exit;
 }
 $users = oc_read_users();
-$logs = oc_logs(80);
+$logs = oc_logs(50);
 $sessions = oc_active_sessions();
 $active = count($sessions);
 $todayConnects = 0;
@@ -2184,13 +2269,13 @@ render_header('OpenConnect');
   </form>
   <div class="table-wrap">
     <table style="min-width:700px">
-      <tr><th>Username</th><th>Password</th><th>Status</th><th>Action</th></tr>
-      <?php if(!$users): ?><tr><td colspan="4" class="empty">No OpenConnect users yet.</td></tr>
+      <tr><th>Username</th><th>Password</th><th>Action</th></tr>
+      <?php if(!$users): ?>
+        <tr><td colspan="3" class="empty">No OpenConnect users yet.</td></tr>
       <?php else: foreach($users as $u): ?>
         <tr>
           <td><strong><?=esc($u['username'])?></strong></td>
           <td><?=esc($u['password'])?></td>
-          <td><?=((int)$u['blocked']===1) ? '<span class="badge red">Blocked</span>' : '<span class="badge green">Active</span>'?></td>
           <td><a class="btn red" href="?delete=<?=urlencode($u['username'])?>" onclick="return confirm('Delete this user?')">Delete</a></td>
         </tr>
       <?php endforeach; endif; ?>
@@ -2202,21 +2287,21 @@ render_header('OpenConnect');
   <div class="toolbar">
     <div>
       <h2 class="section-title" style="margin-bottom:6px">OpenConnect active sessions</h2>
-      <div class="small">Live ocserv socket থেকে active sessions দেখায়। One user multiple device হলে আলাদা আলাদা count হবে।</div>
+      <div class="small">Connected OpenConnect users are shown here.</div>
     </div>
     <span class="badge green"><?=esc($active)?> active</span>
   </div>
   <div class="table-wrap">
     <table style="min-width:900px">
-      <tr><th>User</th><th>Session ID</th><th>Real IP</th><th>VPN IP</th><th>Status</th></tr>
-      <?php if(!$sessions): ?><tr><td colspan="5" class="empty">No active OpenConnect sessions.</td></tr>
+      <tr><th>User</th><th>IP</th><th>VPN IP</th><th>Connected</th></tr>
+      <?php if(!$sessions): ?>
+        <tr><td colspan="4" class="empty">No active OpenConnect sessions.</td></tr>
       <?php else: foreach($sessions as $s): ?>
         <tr>
           <td><?=esc($s['username'])?></td>
-          <td><?=esc($s['session_id'])?></td>
           <td><?=esc($s['real_ip'])?></td>
           <td><?=esc($s['vpn_ip'])?></td>
-          <td><?=esc($s['connected_since'])?></td>
+          <td><?=esc($s['event_time'])?></td>
         </tr>
       <?php endforeach; endif; ?>
     </table>
@@ -2226,11 +2311,11 @@ render_header('OpenConnect');
 
 <div class="card" style="margin-top:18px">
   <h2 class="section-title">OpenConnect logs</h2>
-  <div class="small" style="margin-bottom:12px">Logs history only. Active count logs থেকে নেওয়া হয় না।</div>
   <div class="table-wrap">
     <table style="min-width:900px">
       <tr><th>Time</th><th>Event</th><th>User</th><th>IP</th><th>VPN IP</th></tr>
-      <?php if(!$logs): ?><tr><td colspan="5" class="empty">No OpenConnect logs yet.</td></tr>
+      <?php if(!$logs): ?>
+        <tr><td colspan="5" class="empty">No OpenConnect logs yet.</td></tr>
       <?php else: foreach($logs as $r): ?>
         <tr>
           <td><?=esc($r['event_time'])?></td>
@@ -2245,16 +2330,13 @@ render_header('OpenConnect');
 </div>
 <?php render_footer(); ?>
 PHP
+
 echo "[5/6] Restarting services..."
 systemctl restart ocserv || true
-sleep 2
-echo "OpenConnect sockets:"
-ls -la /run/ocserv-socket* /var/run/ocserv-socket* 2>/dev/null || true
-sudo /usr/local/bin/oc-active-sessions.sh 2>/dev/null || true
 systemctl restart apache2 || true
 
 echo "[6/6] Done."
-echo "OpenConnect page now uses dynamic live socket active sessions and counters."
+echo "OpenConnect page now uses log-based active sessions and counters."
 echo "Refresh: http://YOUR-IP/ovpn-admin/openconnect.php"
 
 
@@ -2631,3 +2713,220 @@ echo "✅ Xray page cleaned: active count + config copy only."
 
 echo "✅ OpenConnect page fully overwritten with URL copy box."
 echo "✅ Xray count uses unique established client IPs."
+# ============================================================
+# FINAL OPENCONNECT FIX OVERRIDE - ChatGPT patched
+# Keeps all previous OpenVPN / Xray / Panel code, fixes only OpenConnect.
+# ============================================================
+echo "[FINAL FIX] Applying OpenConnect live count + multi-device + panel fix..."
+
+APP_DIR="/var/www/html/ovpn-admin"
+DATA_DIR="$APP_DIR/data"
+mkdir -p "$DATA_DIR"
+
+if [[ -f /etc/ocserv/ocserv.conf ]]; then
+  cp /etc/ocserv/ocserv.conf /etc/ocserv/ocserv.conf.bak.$(date +%s) || true
+  sed -i '/^use-occtl[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^socket-file[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^occtl-socket-file[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^isolate-workers[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^duplicate-users[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^connect-script[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  sed -i '/^disconnect-script[[:space:]]*=.*/d' /etc/ocserv/ocserv.conf
+  cat >> /etc/ocserv/ocserv.conf <<'EOF_OCSERV_FIX'
+
+# Final panel/live-session fix
+use-occtl = true
+socket-file = /run/occtl.socket
+isolate-workers = false
+max-same-clients = 0
+duplicate-users = true
+connect-script = /usr/local/bin/oc-event-log.sh
+disconnect-script = /usr/local/bin/oc-event-log.sh
+EOF_OCSERV_FIX
+fi
+
+sqlite3 "$DATA_DIR/oc_events.sqlite" <<'SQL'
+CREATE TABLE IF NOT EXISTS oc_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_time TEXT DEFAULT CURRENT_TIMESTAMP,
+  event_type TEXT,
+  username TEXT,
+  real_ip TEXT,
+  vpn_ip TEXT,
+  user_agent TEXT,
+  duration INTEGER DEFAULT 0,
+  bytes_in INTEGER DEFAULT 0,
+  bytes_out INTEGER DEFAULT 0
+);
+SQL
+chown www-data:www-data "$DATA_DIR/oc_events.sqlite" 2>/dev/null || true
+chmod 664 "$DATA_DIR/oc_events.sqlite" 2>/dev/null || true
+
+cat >/usr/local/bin/oc-event-log.sh <<'EOF_OC_EVENT'
+#!/usr/bin/env bash
+set -euo pipefail
+DB="/var/www/html/ovpn-admin/data/oc_events.sqlite"
+TYPE="${REASON:-${script_type:-connect}}"
+USER_NAME="${USERNAME:-${USER:-${username:-}}}"
+REAL_IP="${IP_REAL:-${REMOTE_HOST:-${trusted_ip:-}}}"
+VPN_IP="${IP_REMOTE:-${IP_LOCAL:-${ifconfig_pool_remote_ip:-}}}"
+AGENT="${USER_AGENT:-${DEVICE_TYPE:-}}"
+DUR="${STATS_DURATION:-${time_duration:-0}}"
+BIN="${STATS_BYTES_IN:-${bytes_received:-0}}"
+BOUT="${STATS_BYTES_OUT:-${bytes_sent:-0}}"
+TYPE_L="$(printf '%s' "$TYPE" | tr '[:upper:]' '[:lower:]')"
+case "$TYPE_L" in
+  *disconnect*) EVENT_TYPE="disconnect" ;;
+  *) EVENT_TYPE="connect" ;;
+esac
+esc(){ printf "%s" "$1" | sed "s/'/''/g"; }
+mkdir -p "$(dirname "$DB")"
+sqlite3 "$DB" <<SQL
+INSERT INTO oc_events(event_type,username,real_ip,vpn_ip,user_agent,duration,bytes_in,bytes_out)
+VALUES('$(esc "$EVENT_TYPE")','$(esc "$USER_NAME")','$(esc "$REAL_IP")','$(esc "$VPN_IP")','$(esc "$AGENT")',${DUR:-0},${BIN:-0},${BOUT:-0});
+SQL
+EOF_OC_EVENT
+chmod 755 /usr/local/bin/oc-event-log.sh
+chown root:root /usr/local/bin/oc-event-log.sh
+
+cat >/usr/local/bin/oc-active-sessions.sh <<'EOF_OC_ACTIVE'
+#!/usr/bin/env bash
+set -euo pipefail
+export PAGER=cat
+SOCK="/run/occtl.socket"
+if [[ -S "$SOCK" ]]; then
+  occtl -s "$SOCK" show users 2>/dev/null || true
+  exit 0
+fi
+for s in /run/occtl.socket.* /run/ocserv-socket.* /var/run/occtl.socket.* /var/run/ocserv-socket.*; do
+  [[ -S "$s" ]] || continue
+  occtl -s "$s" show users 2>/dev/null && exit 0 || true
+done
+exit 0
+EOF_OC_ACTIVE
+chmod 755 /usr/local/bin/oc-active-sessions.sh
+chown root:root /usr/local/bin/oc-active-sessions.sh
+
+cat >/usr/local/bin/oc-sessions.sh <<'EOF_OC_SESSIONS'
+#!/usr/bin/env bash
+exec /usr/local/bin/oc-active-sessions.sh
+EOF_OC_SESSIONS
+chmod 755 /usr/local/bin/oc-sessions.sh
+chown root:root /usr/local/bin/oc-sessions.sh
+
+cat >/etc/sudoers.d/ovpn-oc-fixed <<'EOF_SUDO_OC'
+www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-user-manage.sh
+www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-active-sessions.sh
+www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-sessions.sh
+EOF_SUDO_OC
+chmod 440 /etc/sudoers.d/ovpn-oc-fixed
+visudo -cf /etc/sudoers.d/ovpn-oc-fixed >/dev/null
+
+python3 - <<'PY'
+from pathlib import Path
+cfg = Path('/var/www/html/ovpn-admin/config.php')
+if cfg.exists():
+    s = cfg.read_text()
+    anchor = '<a href="change_password.php">Change Admin Password</a>'
+    link = '<a href="openconnect.php">OpenConnect</a>'
+    if link not in s and anchor in s:
+        s = s.replace(anchor, link + '\n      ' + anchor)
+    cfg.write_text(s)
+PY
+
+cat >"$APP_DIR/openconnect.php" <<'PHP_OC_PAGE'
+<?php
+require __DIR__.'/config.php';
+require_login();
+
+function oc_users_path(){ return __DIR__ . '/data/oc_users.csv'; }
+function oc_read_users(){
+    $f = oc_users_path();
+    $rows = [];
+    if (!is_file($f) || !is_readable($f)) return $rows;
+    foreach(file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line){
+        $line = trim($line);
+        if($line === '') continue;
+        $p = (strpos($line, '|') !== false) ? explode('|', $line) : str_getcsv($line);
+        if(count($p) >= 1 && trim($p[0]) !== ''){
+            $rows[] = ['username'=>trim($p[0]), 'password'=>$p[1] ?? '', 'blocked'=>(int)($p[2] ?? 0)];
+        }
+    }
+    return $rows;
+}
+function oc_logs($limit=80){
+    $dbFile = __DIR__.'/data/oc_events.sqlite';
+    if(!is_file($dbFile)) return [];
+    $db = new SQLite3($dbFile); $db->busyTimeout(3000);
+    $res = $db->query('SELECT * FROM oc_events ORDER BY id DESC LIMIT '.(int)$limit);
+    $rows = [];
+    if($res){ while($row = $res->fetchArray(SQLITE3_ASSOC)) $rows[] = $row; }
+    return $rows;
+}
+function oc_active_sessions(){
+    $out = shell_exec('sudo /usr/local/bin/oc-active-sessions.sh 2>/dev/null');
+    $rows = [];
+    if(!$out) return $rows;
+    foreach(explode("\n", trim($out)) as $line){
+        $line = trim($line);
+        if($line === '') continue;
+        if(stripos($line, 'id') === 0 || stripos($line, '---') === 0 || $line[0] === '(') continue;
+        if(!preg_match('/^\d+\s+/', $line)) continue;
+        $p = preg_split('/\s+/', $line);
+        $rows[] = [
+            'session_id'=>$p[0] ?? '-', 'username'=>$p[1] ?? 'unknown', 'vhost'=>$p[2] ?? '-',
+            'real_ip'=>$p[3] ?? '-', 'vpn_ip'=>$p[4] ?? '-', 'device'=>$p[5] ?? '-',
+            'connected_since'=>$p[6] ?? 'live', 'dtls'=>$p[7] ?? '-'
+        ];
+    }
+    return $rows;
+}
+
+$msg=''; $err='';
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['add_user'])) {
+    $u = trim($_POST['username'] ?? ''); $p = trim($_POST['password'] ?? '');
+    if ($u === '' || $p === '') $err = 'Username and password required';
+    else { exec('sudo /usr/local/bin/oc-user-manage.sh add '.escapeshellarg($u).' '.escapeshellarg($p).' 2>&1', $out, $code); if ($code === 0) $msg = 'User added'; else $err = trim(implode("\n", $out)) ?: 'Failed'; }
+}
+if (isset($_GET['delete']) && $_GET['delete'] !== '') { exec('sudo /usr/local/bin/oc-user-manage.sh delete '.escapeshellarg(trim($_GET['delete'])).' 2>&1'); header('Location: openconnect.php'); exit; }
+if (isset($_GET['block']) && $_GET['block'] !== '') { exec('sudo /usr/local/bin/oc-user-manage.sh block '.escapeshellarg(trim($_GET['block'])).' 2>&1'); header('Location: openconnect.php'); exit; }
+if (isset($_GET['unblock']) && $_GET['unblock'] !== '') { exec('sudo /usr/local/bin/oc-user-manage.sh unblock '.escapeshellarg(trim($_GET['unblock'])).' 2>&1'); header('Location: openconnect.php'); exit; }
+
+$users = oc_read_users(); $logs = oc_logs(80); $sessions = oc_active_sessions(); $active = count($sessions);
+$todayConnects = 0; foreach($logs as $r){ if(($r['event_type'] ?? '') === 'connect' && substr((string)($r['event_time'] ?? ''),0,10) === gmdate('Y-m-d')) $todayConnects++; }
+$server = $_SERVER['SERVER_ADDR'] ?? $_SERVER['SERVER_NAME'] ?? 'SERVER_IP';
+render_header('OpenConnect');
+?>
+<div class="grid">
+  <div class="card"><div class="muted">OpenConnect max capacity</div><div class="kpi">100000</div></div>
+  <div class="card"><div class="muted">OpenConnect active now</div><div class="kpi"><?=esc($active)?></div></div>
+  <div class="card"><div class="muted">OpenConnect total users</div><div class="kpi"><?=esc(count($users))?></div></div>
+  <div class="card"><div class="muted">Today connected</div><div class="kpi"><?=esc($todayConnects)?></div></div>
+</div>
+<div class="card" style="margin-top:18px"><h2 class="section-title">OpenConnect URL</h2><div class="code">https://<?=esc($server)?>:443</div></div>
+<div class="card" style="margin-top:18px">
+  <h2 class="section-title">OpenConnect users</h2><div class="small">এই page-এর username/password দিয়েই OpenConnect login হবে।</div><br>
+  <?php if($msg): ?><div class="flash"><?=esc($msg)?></div><?php endif; ?><?php if($err): ?><div class="flash error"><?=esc($err)?></div><?php endif; ?>
+  <form method="post" class="actions" style="margin-bottom:14px"><input name="username" placeholder="Username" required><input name="password" placeholder="Password" required><button class="btn" name="add_user" value="1" type="submit">Add</button></form>
+  <div class="table-wrap"><table style="min-width:800px"><tr><th>Username</th><th>Password</th><th>Status</th><th>Action</th></tr>
+  <?php if(!$users): ?><tr><td colspan="4" class="empty">No OpenConnect users yet.</td></tr><?php else: foreach($users as $u): ?><tr><td><strong><?=esc($u['username'])?></strong></td><td><?=esc($u['password'])?></td><td><?=((int)$u['blocked']===1) ? '<span class="badge red">Blocked</span>' : '<span class="badge green">Active</span>'?></td><td class="actions"><?php if((int)$u['blocked']===1): ?><a class="btn yellow" href="?unblock=<?=urlencode($u['username'])?>">Unblock</a><?php else: ?><a class="btn red" href="?block=<?=urlencode($u['username'])?>" onclick="return confirm('Block this user?')">Block</a><?php endif; ?><a class="btn red" href="?delete=<?=urlencode($u['username'])?>" onclick="return confirm('Delete this user?')">Delete</a></td></tr><?php endforeach; endif; ?></table></div>
+</div>
+<div class="card" style="margin-top:18px"><div class="toolbar"><div><h2 class="section-title" style="margin-bottom:6px">OpenConnect active sessions</h2><div class="small">Live occtl socket থেকে active sessions দেখায়। Same user multiple device হলে আলাদা count হবে।</div></div><span class="badge green"><?=esc($active)?> active</span></div>
+  <div class="table-wrap"><table style="min-width:1000px"><tr><th>User</th><th>Session ID</th><th>Real IP</th><th>VPN IP</th><th>Device</th><th>Since</th><th>DTLS</th></tr>
+  <?php if(!$sessions): ?><tr><td colspan="7" class="empty">No active OpenConnect sessions.</td></tr><?php else: foreach($sessions as $s): ?><tr><td><?=esc($s['username'])?></td><td><?=esc($s['session_id'])?></td><td><?=esc($s['real_ip'])?></td><td><?=esc($s['vpn_ip'])?></td><td><?=esc($s['device'])?></td><td><?=esc($s['connected_since'])?></td><td><?=esc($s['dtls'])?></td></tr><?php endforeach; endif; ?></table></div>
+</div>
+<div class="card" style="margin-top:18px"><h2 class="section-title">OpenConnect logs</h2><div class="small" style="margin-bottom:12px">History logs. Active count logs থেকে নেওয়া হয় না; live occtl থেকে নেওয়া হয়।</div><div class="table-wrap"><table style="min-width:900px"><tr><th>Time</th><th>Event</th><th>User</th><th>IP</th><th>VPN IP</th></tr><?php if(!$logs): ?><tr><td colspan="5" class="empty">No OpenConnect logs yet.</td></tr><?php else: foreach($logs as $r): ?><tr><td><?=esc($r['event_time'] ?? '')?></td><td><?=esc($r['event_type'] ?? '')?></td><td><?=esc($r['username'] ?? '')?></td><td><?=esc($r['real_ip'] ?? '')?></td><td><?=esc($r['vpn_ip'] ?? '')?></td></tr><?php endforeach; endif; ?></table></div></div>
+<?php render_footer(); ?>
+PHP_OC_PAGE
+
+chown -R www-data:www-data "$APP_DIR" 2>/dev/null || true
+chmod -R 755 "$APP_DIR" 2>/dev/null || true
+chmod -R 777 "$DATA_DIR" 2>/dev/null || true
+rm -f /run/ocserv-socket* /run/occtl.socket* 2>/dev/null || true
+systemctl daemon-reload || true
+systemctl enable ocserv >/dev/null 2>&1 || true
+systemctl restart ocserv || true
+systemctl restart apache2 || true
+sleep 2
+
+echo "✅ FINAL OpenConnect fix applied. Test: occtl -s /run/occtl.socket show users"
