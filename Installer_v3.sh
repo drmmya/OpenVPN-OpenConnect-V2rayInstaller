@@ -381,7 +381,7 @@ ifconfig-pool-persist ${LOG_DIR}/ipp-udp.txt
 push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS 8.8.8.8"
-keepalive 10 120
+keepalive 5 20
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 data-ciphers-fallback AES-256-CBC
 auth SHA256
@@ -418,7 +418,7 @@ ifconfig-pool-persist ${LOG_DIR}/ipp-tcp.txt
 push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS 8.8.8.8"
-keepalive 10 120
+keepalive 5 20
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 data-ciphers-fallback AES-256-CBC
 auth SHA256
@@ -507,8 +507,8 @@ function latest_logs($limit=300,$search=''){
     return $rows;
 }
 function parse_status_file($file){
-    // FIXED: Every CLIENT_LIST row is one live OpenVPN session/device.
-    // This prevents same public IP / hotspot users from being collapsed into one count.
+    // FINAL FIX: Every CLIENT_LIST row is one live OpenVPN session/device.
+    // Same public IP / hotspot users are NOT collapsed.
     $rows=[];
     if(!is_file($file) || !is_readable($file)) return $rows;
     $lines=@file($file, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
@@ -531,7 +531,7 @@ function parse_status_file($file){
         $clientId='';
         $cipher='';
 
-        // OpenVPN status-version 3 commonly:
+        // status-version 3:
         // CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher
         if(count($p) >= 10){
             $virtual=$p[3] ?? '';
@@ -542,7 +542,6 @@ function parse_status_file($file){
             $clientId=$p[10] ?? '';
             $cipher=$p[count($p)-1] ?? '';
         } else {
-            // status-version 1/2 fallback
             $rx=(int)($p[3] ?? 0);
             $tx=(int)($p[4] ?? 0);
             $since=$p[5] ?? '';
@@ -562,7 +561,6 @@ function parse_status_file($file){
             'cipher'=>$cipher,
         ];
     }
-
     return $rows;
 }
 function active_from_events(){
@@ -594,8 +592,8 @@ function active_from_events(){
     return $rows;
 }
 function active_clients(){
-    // FIXED: Active devices must come only from OpenVPN live status files.
-    // Do not fallback to connection_events, because event logs can leave stale active rows after disconnect.
+    // FINAL FIX: Active devices come ONLY from OpenVPN live status files.
+    // Event logs are history and can create stale active rows after disconnect.
     $rows=[];
     foreach(['/var/log/openvpn/openvpn-status-udp.log'=>'UDP','/var/log/openvpn/openvpn-status-tcp.log'=>'TCP'] as $file=>$source){
         foreach(parse_status_file($file) as $r){
@@ -1292,7 +1290,7 @@ udp-port = 443
 run-as-user = nobody
 run-as-group = daemon
 
-# FIXED OpenConnect live control socket for panel
+# FINAL FIX: OpenConnect live control socket for panel
 use-occtl = true
 socket-file = /run/occtl.socket
 isolate-workers = false
@@ -3017,16 +3015,17 @@ systemctl restart apache2 || true
 
 echo "✅ FINAL OpenVPN multi-device count + OpenConnect count fix applied."
 
+
 # =========================================================
 # FINAL LIVE PANEL FIXES: OpenVPN/OpenConnect/AJAX
 # =========================================================
 echo "[FINAL] Applying live panel fixes..."
 
-# OpenVPN status files should be readable by Apache
+# OpenVPN status file permissions for Apache panel
 chmod 644 /var/log/openvpn/openvpn-status-udp.log /var/log/openvpn/openvpn-status-tcp.log 2>/dev/null || true
 setfacl -m u:www-data:r /var/log/openvpn/openvpn-status-udp.log /var/log/openvpn/openvpn-status-tcp.log 2>/dev/null || true
 
-# Make sure OpenConnect is using the fixed occtl socket
+# OpenConnect socket and helper
 rm -f /run/ocserv-socket* /run/occtl.socket* 2>/dev/null || true
 systemctl restart ocserv || true
 sleep 2
@@ -3044,7 +3043,7 @@ www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-active-sessions.sh
 EOF
 chmod 440 /etc/sudoers.d/ocserv-panel
 
-# Add AJAX auto-refresh every 3 seconds to dashboard without full page reload
+# Add live AJAX CSS
 cat >>/var/www/html/ovpn-admin/style.css <<'CSS'
 
 .live-flash {
@@ -3056,36 +3055,90 @@ cat >>/var/www/html/ovpn-admin/style.css <<'CSS'
 }
 CSS
 
-# Inject AJAX only once
-if ! grep -q "OVPN_AJAX_REFRESH_FIX" /var/www/html/ovpn-admin/index.php 2>/dev/null; then
+# Dashboard AJAX auto refresh every 3s
+if ! grep -q "VPN_AJAX_REFRESH_FINAL" /var/www/html/ovpn-admin/index.php 2>/dev/null; then
   sed -i '/<?php render_footer(); ?>/i \
-<script id="OVPN_AJAX_REFRESH_FIX">\
-let __lastLiveCounts = "";\
+<script id="VPN_AJAX_REFRESH_FINAL">\
+let __lastGridText = "";\
 async function vpnLiveRefresh(){\
   try{\
     const res = await fetch(window.location.href, {cache:"no-store"});\
     const html = await res.text();\
     const doc = new DOMParser().parseFromString(html, "text/html");\
-    const newGrid = doc.querySelector(".grid");\
     const oldGrid = document.querySelector(".grid");\
-    if(newGrid && oldGrid){\
-      const newCounts = newGrid.innerText.trim();\
-      if(__lastLiveCounts && __lastLiveCounts !== newCounts){ oldGrid.classList.add("live-flash"); setTimeout(()=>oldGrid.classList.remove("live-flash"),800); }\
-      __lastLiveCounts = newCounts;\
+    const newGrid = doc.querySelector(".grid");\
+    if(oldGrid && newGrid){\
+      const t = newGrid.innerText.trim();\
+      if(__lastGridText && __lastGridText !== t){ oldGrid.classList.add("live-flash"); setTimeout(()=>oldGrid.classList.remove("live-flash"), 800); }\
+      __lastGridText = t;\
       oldGrid.innerHTML = newGrid.innerHTML;\
     }\
-    const newTables = doc.querySelectorAll(".table-wrap");\
     const oldTables = document.querySelectorAll(".table-wrap");\
-    newTables.forEach((t,i)=>{ if(oldTables[i]) oldTables[i].innerHTML = t.innerHTML; });\
-    const newBadges = doc.querySelectorAll(".badge");\
-    const oldBadges = document.querySelectorAll(".badge");\
-    newBadges.forEach((b,i)=>{ if(oldBadges[i]) oldBadges[i].innerHTML = b.innerHTML; });\
-  }catch(e){ console.log("live refresh error", e); }\
+    const newTables = doc.querySelectorAll(".table-wrap");\
+    newTables.forEach((el,i)=>{ if(oldTables[i]) oldTables[i].innerHTML = el.innerHTML; });\
+    const oldToolbar = document.querySelectorAll(".toolbar");\
+    const newToolbar = doc.querySelectorAll(".toolbar");\
+    newToolbar.forEach((el,i)=>{ if(oldToolbar[i]) oldToolbar[i].innerHTML = el.innerHTML; });\
+  }catch(e){ console.log("VPN live refresh error", e); }\
 }\
 setInterval(vpnLiveRefresh, 3000);\
 vpnLiveRefresh();\
 </script>' /var/www/html/ovpn-admin/index.php
 fi
 
+# OpenConnect page AJAX auto refresh every 3s if page exists
+if [ -f /var/www/html/ovpn-admin/openconnect.php ] && ! grep -q "OC_AJAX_REFRESH_FINAL" /var/www/html/ovpn-admin/openconnect.php 2>/dev/null; then
+  sed -i '/<?php render_footer(); ?>/i \
+<script id="OC_AJAX_REFRESH_FINAL">\
+let __lastOCText = "";\
+async function ocLiveRefresh(){\
+  try{\
+    const res = await fetch(window.location.href, {cache:"no-store"});\
+    const html = await res.text();\
+    const doc = new DOMParser().parseFromString(html, "text/html");\
+    const oldGrid = document.querySelector(".grid");\
+    const newGrid = doc.querySelector(".grid");\
+    if(oldGrid && newGrid){\
+      const t = newGrid.innerText.trim();\
+      if(__lastOCText && __lastOCText !== t){ oldGrid.classList.add("live-flash"); setTimeout(()=>oldGrid.classList.remove("live-flash"), 800); }\
+      __lastOCText = t;\
+      oldGrid.innerHTML = newGrid.innerHTML;\
+    }\
+    const oldTables = document.querySelectorAll(".table-wrap");\
+    const newTables = doc.querySelectorAll(".table-wrap");\
+    newTables.forEach((el,i)=>{ if(oldTables[i]) oldTables[i].innerHTML = el.innerHTML; });\
+    const oldToolbar = document.querySelectorAll(".toolbar");\
+    const newToolbar = doc.querySelectorAll(".toolbar");\
+    newToolbar.forEach((el,i)=>{ if(oldToolbar[i]) oldToolbar[i].innerHTML = el.innerHTML; });\
+  }catch(e){ console.log("OC live refresh error", e); }\
+}\
+setInterval(ocLiveRefresh, 3000);\
+ocLiveRefresh();\
+</script>' /var/www/html/ovpn-admin/openconnect.php
+fi
+
+# Faster stale cleanup behavior: restart OpenVPN if status files become older than 90s.
+# This is a safety fallback only; normal live count still comes from status files.
+cat >/usr/local/bin/ovpn-status-watchdog.sh <<'EOF'
+#!/usr/bin/env bash
+now=$(date +%s)
+changed=0
+for f in /var/log/openvpn/openvpn-status-udp.log /var/log/openvpn/openvpn-status-tcp.log; do
+  [ -f "$f" ] || continue
+  mt=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  age=$((now-mt))
+  if [ "$age" -gt 90 ]; then
+    changed=1
+  fi
+done
+if [ "$changed" = "1" ]; then
+  systemctl restart openvpn-server@server-udp 2>/dev/null || true
+  systemctl restart openvpn-server@server-tcp 2>/dev/null || true
+fi
+EOF
+chmod +x /usr/local/bin/ovpn-status-watchdog.sh
+(crontab -l 2>/dev/null | grep -v 'ovpn-status-watchdog.sh'; echo '* * * * * /usr/local/bin/ovpn-status-watchdog.sh >/dev/null 2>&1') | crontab -
+
 systemctl restart apache2 || true
 echo "[FINAL] Live panel fixes applied."
+
