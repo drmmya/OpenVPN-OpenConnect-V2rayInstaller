@@ -396,7 +396,7 @@ auth-user-pass-verify ${BIN_DIR}/ovpn-auth.php via-file
 script-security 3
 duplicate-cn
 client-to-client
-status ${LOG_DIR}/openvpn-status-udp.log 3
+status ${LOG_DIR}/openvpn-status-udp.log 1
 status-version 3
 management 127.0.0.1 7505
 log-append ${LOG_DIR}/server-udp.log
@@ -433,7 +433,7 @@ auth-user-pass-verify ${BIN_DIR}/ovpn-auth.php via-file
 script-security 3
 duplicate-cn
 client-to-client
-status ${LOG_DIR}/openvpn-status-tcp.log 3
+status ${LOG_DIR}/openvpn-status-tcp.log 1
 status-version 3
 management 127.0.0.1 7506
 log-append ${LOG_DIR}/server-tcp.log
@@ -507,9 +507,8 @@ function latest_logs($limit=300,$search=''){
     return $rows;
 }
 function parse_status_file($file){
-    // FIXED: Count every OpenVPN CLIENT_LIST row as one live device/session.
-    // Old code used common_name + real_ip as an array key, so multiple devices behind
-    // one hotspot/public IP were collapsed into 1. This version never collapses rows.
+    // FIXED: Every CLIENT_LIST row is one live OpenVPN session/device.
+    // This prevents same public IP / hotspot users from being collapsed into one count.
     $rows=[];
     if(!is_file($file) || !is_readable($file)) return $rows;
     $lines=@file($file, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
@@ -519,13 +518,21 @@ function parse_status_file($file){
         $line=trim($line);
         if($line==='' || strpos($line,'CLIENT_LIST')!==0) continue;
 
-        $p=preg_split('/[,\t]/', $line);
+        $p=preg_split('/[,	]/', $line);
         if(!$p || count($p)<3) continue;
 
         $common=$p[1] ?? '';
         $real=$p[2] ?? '';
+        $virtual='';
+        $rx=0;
+        $tx=0;
+        $since='';
+        $username=$common;
+        $clientId='';
+        $cipher='';
 
-        $virtual=''; $rx=0; $tx=0; $since=''; $username=''; $clientId=''; $cipher='';
+        // OpenVPN status-version 3 commonly:
+        // CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher
         if(count($p) >= 10){
             $virtual=$p[3] ?? '';
             $rx=(int)($p[5] ?? 0);
@@ -535,6 +542,7 @@ function parse_status_file($file){
             $clientId=$p[10] ?? '';
             $cipher=$p[count($p)-1] ?? '';
         } else {
+            // status-version 1/2 fallback
             $rx=(int)($p[3] ?? 0);
             $tx=(int)($p[4] ?? 0);
             $since=$p[5] ?? '';
@@ -554,6 +562,7 @@ function parse_status_file($file){
             'cipher'=>$cipher,
         ];
     }
+
     return $rows;
 }
 function active_from_events(){
@@ -585,6 +594,8 @@ function active_from_events(){
     return $rows;
 }
 function active_clients(){
+    // FIXED: Active devices must come only from OpenVPN live status files.
+    // Do not fallback to connection_events, because event logs can leave stale active rows after disconnect.
     $rows=[];
     foreach(['/var/log/openvpn/openvpn-status-udp.log'=>'UDP','/var/log/openvpn/openvpn-status-tcp.log'=>'TCP'] as $file=>$source){
         foreach(parse_status_file($file) as $r){
@@ -594,7 +605,6 @@ function active_clients(){
             $rows[]=$r;
         }
     }
-    if(!$rows) $rows=active_from_events();
     return $rows;
 }
 function active_clients_by_user(){
@@ -631,7 +641,6 @@ function render_header($title='OpenVPN Admin'){
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="15">
 <title><?=esc($title)?></title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -1282,8 +1291,13 @@ tcp-port = 443
 udp-port = 443
 run-as-user = nobody
 run-as-group = daemon
-socket-file = /run/ocserv-socket
-occtl-socket-file = /run/occtl.socket
+
+# FIXED OpenConnect live control socket for panel
+use-occtl = true
+socket-file = /run/occtl.socket
+isolate-workers = false
+duplicate-users = true
+
 server-cert = ${OC_SSL_DIR}/server-cert.pem
 server-key = ${OC_SSL_DIR}/server-key.pem
 max-clients = 100000
@@ -1301,7 +1315,6 @@ mobile-dpd = 1800
 switch-to-tcp-timeout = 25
 try-mtu-discovery = false
 compression = false
-isolate-workers = true
 server-stats-reset-time = 604800
 device = vpns
 predictable-ips = true
@@ -3003,3 +3016,76 @@ chmod 440 /etc/sudoers.d/ocserv-panel
 systemctl restart apache2 || true
 
 echo "✅ FINAL OpenVPN multi-device count + OpenConnect count fix applied."
+
+# =========================================================
+# FINAL LIVE PANEL FIXES: OpenVPN/OpenConnect/AJAX
+# =========================================================
+echo "[FINAL] Applying live panel fixes..."
+
+# OpenVPN status files should be readable by Apache
+chmod 644 /var/log/openvpn/openvpn-status-udp.log /var/log/openvpn/openvpn-status-tcp.log 2>/dev/null || true
+setfacl -m u:www-data:r /var/log/openvpn/openvpn-status-udp.log /var/log/openvpn/openvpn-status-tcp.log 2>/dev/null || true
+
+# Make sure OpenConnect is using the fixed occtl socket
+rm -f /run/ocserv-socket* /run/occtl.socket* 2>/dev/null || true
+systemctl restart ocserv || true
+sleep 2
+
+cat >/usr/local/bin/oc-active-sessions.sh <<'EOF'
+#!/usr/bin/env bash
+SOCK="/run/occtl.socket"
+[ -S "$SOCK" ] || exit 0
+occtl -s "$SOCK" show users 2>/dev/null || true
+EOF
+chmod +x /usr/local/bin/oc-active-sessions.sh
+
+cat >/etc/sudoers.d/ocserv-panel <<'EOF'
+www-data ALL=(root) NOPASSWD: /usr/local/bin/oc-active-sessions.sh
+EOF
+chmod 440 /etc/sudoers.d/ocserv-panel
+
+# Add AJAX auto-refresh every 3 seconds to dashboard without full page reload
+cat >>/var/www/html/ovpn-admin/style.css <<'CSS'
+
+.live-flash {
+  animation: liveFlash .75s ease;
+}
+@keyframes liveFlash {
+  0% { box-shadow: 0 0 0 0 rgba(34,199,147,.70); transform: scale(1.01); }
+  100% { box-shadow: 0 0 0 14px rgba(34,199,147,0); transform: scale(1); }
+}
+CSS
+
+# Inject AJAX only once
+if ! grep -q "OVPN_AJAX_REFRESH_FIX" /var/www/html/ovpn-admin/index.php 2>/dev/null; then
+  sed -i '/<?php render_footer(); ?>/i \
+<script id="OVPN_AJAX_REFRESH_FIX">\
+let __lastLiveCounts = "";\
+async function vpnLiveRefresh(){\
+  try{\
+    const res = await fetch(window.location.href, {cache:"no-store"});\
+    const html = await res.text();\
+    const doc = new DOMParser().parseFromString(html, "text/html");\
+    const newGrid = doc.querySelector(".grid");\
+    const oldGrid = document.querySelector(".grid");\
+    if(newGrid && oldGrid){\
+      const newCounts = newGrid.innerText.trim();\
+      if(__lastLiveCounts && __lastLiveCounts !== newCounts){ oldGrid.classList.add("live-flash"); setTimeout(()=>oldGrid.classList.remove("live-flash"),800); }\
+      __lastLiveCounts = newCounts;\
+      oldGrid.innerHTML = newGrid.innerHTML;\
+    }\
+    const newTables = doc.querySelectorAll(".table-wrap");\
+    const oldTables = document.querySelectorAll(".table-wrap");\
+    newTables.forEach((t,i)=>{ if(oldTables[i]) oldTables[i].innerHTML = t.innerHTML; });\
+    const newBadges = doc.querySelectorAll(".badge");\
+    const oldBadges = document.querySelectorAll(".badge");\
+    newBadges.forEach((b,i)=>{ if(oldBadges[i]) oldBadges[i].innerHTML = b.innerHTML; });\
+  }catch(e){ console.log("live refresh error", e); }\
+}\
+setInterval(vpnLiveRefresh, 3000);\
+vpnLiveRefresh();\
+</script>' /var/www/html/ovpn-admin/index.php
+fi
+
+systemctl restart apache2 || true
+echo "[FINAL] Live panel fixes applied."
