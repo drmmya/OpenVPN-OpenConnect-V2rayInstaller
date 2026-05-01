@@ -1,9 +1,0 @@
-Fixed in this build:
-- System Control install/start/stop/restart/change-port now uses AJAX, so the page does not reload.
-- Install action is sent with a hidden action field, so disabling the clicked button cannot remove action=install from POST.
-- OpenVPN install button now starts only OpenVPN.
-- OpenConnect install button now starts only OpenConnect.
-- V2Ray/Xray install button now starts only V2Ray/Xray.
-- Panel install logs are now written to one fresh per-protocol path: panel-admin/data/install-logs/{openvpn,openconnect,v2ray}.log
-- install_log.php chooses the newest readable log, avoiding stale /var/log logs being shown in the wrong mini card.
-- Mini logs and full logs continue to auto-refresh every 3 seconds.
