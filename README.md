@@ -3,7 +3,7 @@
 Run from the extracted folder on a clean Ubuntu/Debian VPS:
 
 ```bash
-sudo bash main-installer.sh
+sudo apt update && sudo apt install -y curl && sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/drmmya/OpenVPN-OpenConnect-V2rayInstaller/main/main-installer.sh)'
 ```
 
 Panel URL after install:
