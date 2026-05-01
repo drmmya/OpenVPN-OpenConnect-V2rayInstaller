@@ -1,76 +1,247 @@
 #!/usr/bin/env bash
 set -euo pipefail
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/drmmya/OpenVPN-OpenConnect-V2rayInstaller/main}"
-CONF="/etc/vpn-protocols.conf"
-PANEL_DIR="/var/www/html/panel-admin"
-export PANEL_DIR PANEL_ALIAS="vpn-panel" ADMIN_USER="${ADMIN_USER:-openvpn}" ADMIN_PASS="${ADMIN_PASS:-Easin112233@}" DEFAULT_USER="${DEFAULT_USER:-Easin}" DEFAULT_USER_PASS="${DEFAULT_USER_PASS:-Easin112233@}"
 
-get_conf(){ local k="$1" d="${2:-}"; [[ -f "$CONF" ]] && grep -E "^${k}=" "$CONF" | tail -1 | cut -d= -f2- || printf '%s' "$d"; }
-set_conf(){ local k="$1" v="$2"; touch "$CONF"; if grep -qE "^${k}=" "$CONF"; then sed -i "s|^${k}=.*|${k}=${v}|" "$CONF"; else echo "${k}=${v}" >> "$CONF"; fi; chmod 644 "$CONF"; }
-valid_port(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-port_used(){ local p="$1"; ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${p}$"; }
-allow_tcp(){ iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$1" -j ACCEPT; }
-allow_udp(){ iptables -C INPUT -p udp --dport "$1" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$1" -j ACCEPT; }
-fetch(){ local f="$1" d="/tmp/vpn-panel-control-$$"; mkdir -p "$d"; curl -fsSL "$REPO_RAW/$f" -o "$d/$f"; chmod +x "$d/$f"; echo "$d/$f"; }
-ensure_free(){ local p="$1" current="${2:-}"; valid_port "$p" || { echo "Invalid port: $p"; exit 2; }; if [[ "$p" != "$current" ]] && port_used "$p"; then echo "Port $p already used. Choose another port."; exit 3; fi; }
+# Safe control wrapper for VPN Panel
+# Allowed actions only. Designed to be called by www-data via sudo.
 
-case "${1:-}" in
-  port-check)
-    p="${2:-}"; valid_port "$p" || { echo "INVALID"; exit 2; }; if port_used "$p"; then echo "USED"; exit 1; else echo "FREE"; fi ;;
-  status)
-    case "${2:-}" in
-      openvpn) systemctl is-active --quiet openvpn-server@server-udp || systemctl is-active --quiet openvpn-server@server-tcp ;;
-      openconnect) systemctl is-active --quiet ocserv ;;
-      v2ray) systemctl is-active --quiet xray ;;
-      *) exit 2 ;;
-    esac ;;
-  start|stop|restart)
-    act="$1"; proto="${2:-}"
-    case "$proto" in
-      openvpn) systemctl "$act" openvpn-server@server-udp 2>/dev/null || true; systemctl "$act" openvpn-server@server-tcp 2>/dev/null || true ;;
-      openconnect) systemctl "$act" ocserv ;;
-      v2ray) systemctl "$act" xray ;;
-      *) echo "Invalid protocol"; exit 2 ;;
-    esac
-    echo "${proto} ${act} done" ;;
-  install)
-    proto="${2:-}"
-    case "$proto" in
-      openvpn)
-        udp="${3:-1194}"; tcp="${4:-8443}"; ensure_free "$udp" "$(get_conf OVPN_UDP_PORT '')"; ensure_free "$tcp" "$(get_conf OVPN_TCP_PORT '')"
-        export OVPN_UDP_PORT="$udp" OVPN_TCP_PORT="$tcp"; bash "$(fetch install-openvpn.sh)"; set_conf OPENVPN 1; set_conf OVPN_UDP_PORT "$udp"; set_conf OVPN_TCP_PORT "$tcp" ;;
-      openconnect)
-        port="${3:-443}"; ensure_free "$port" "$(get_conf OC_PORT '')"; export OC_PORT="$port"; bash "$(fetch install-openconnect.sh)"; set_conf OPENCONNECT 1; set_conf OC_PORT "$port" ;;
-      v2ray)
-        port="${3:-4443}"; ensure_free "$port" "$(get_conf V2_PORT '')"; export V2_PORT="$port"; bash "$(fetch install-v2ray.sh)"; set_conf V2RAY 1; set_conf V2_PORT "$port" ;;
-      *) echo "Invalid protocol"; exit 2 ;;
-    esac
-    echo "$proto installed" ;;
-  change-port)
-    proto="${2:-}"
-    case "$proto" in
-      openvpn)
-        udp="${3:-}"; tcp="${4:-}"; old_udp="$(get_conf OVPN_UDP_PORT 1194)"; old_tcp="$(get_conf OVPN_TCP_PORT 8443)"; ensure_free "$udp" "$old_udp"; ensure_free "$tcp" "$old_tcp"
-        [[ -f /etc/openvpn/server/server-udp.conf ]] && sed -i "s/^port .*/port ${udp}/" /etc/openvpn/server/server-udp.conf
-        [[ -f /etc/openvpn/server/server-tcp.conf ]] && sed -i "s/^port .*/port ${tcp}/" /etc/openvpn/server/server-tcp.conf
-        if [[ -f /usr/local/bin/ovpn-make-profile.sh ]]; then
-          sed -i -E "s#^remote .* [0-9]+ udp#remote \\${SERVER_ADDR} ${udp} udp#; s#^remote .* [0-9]+ tcp-client#remote \\${SERVER_ADDR} ${tcp} tcp-client#" /usr/local/bin/ovpn-make-profile.sh || true
-        fi
-        allow_udp "$udp"; allow_tcp "$tcp"; set_conf OVPN_UDP_PORT "$udp"; set_conf OVPN_TCP_PORT "$tcp"; systemctl restart openvpn-server@server-udp openvpn-server@server-tcp ;;
-      openconnect)
-        port="${3:-}"; old="$(get_conf OC_PORT 443)"; ensure_free "$port" "$old"; [[ -f /etc/ocserv/ocserv.conf ]] && sed -i -E "s/^tcp-port = .*/tcp-port = ${port}/; s/^udp-port = .*/udp-port = ${port}/" /etc/ocserv/ocserv.conf; allow_tcp "$port"; allow_udp "$port"; set_conf OC_PORT "$port"; systemctl restart ocserv ;;
-      v2ray)
-        port="${3:-}"; old="$(get_conf V2_PORT 4443)"; ensure_free "$port" "$old"; [[ -f /usr/local/etc/xray/config.json ]] && python3 - <<PY
+ACTION="${1:-}"
+PROTO="${2:-}"
+PORT1="${3:-}"
+PORT2="${4:-}"
+
+is_port() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+port_in_use() {
+  local port="$1"
+  ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"
+}
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+service_name() {
+  case "$1" in
+    openvpn-udp) echo "openvpn-server@server-udp" ;;
+    openvpn-tcp) echo "openvpn-server@server-tcp" ;;
+    openvpn) echo "openvpn" ;;
+    openconnect) echo "ocserv" ;;
+    v2ray|xray) echo "xray" ;;
+    apache) echo "apache2" ;;
+    *) fail "Unknown service/protocol: $1" ;;
+  esac
+}
+
+svc_start() {
+  local s
+  case "$1" in
+    openvpn)
+      systemctl start openvpn-server@server-udp || true
+      systemctl start openvpn-server@server-tcp || true
+      ;;
+    openconnect)
+      systemctl start ocserv
+      ;;
+    v2ray|xray)
+      systemctl start xray
+      ;;
+    *)
+      s="$(service_name "$1")"
+      systemctl start "$s"
+      ;;
+  esac
+}
+
+svc_stop() {
+  local s
+  case "$1" in
+    openvpn)
+      systemctl stop openvpn-server@server-udp || true
+      systemctl stop openvpn-server@server-tcp || true
+      ;;
+    openconnect)
+      systemctl stop ocserv
+      ;;
+    v2ray|xray)
+      systemctl stop xray
+      ;;
+    *)
+      s="$(service_name "$1")"
+      systemctl stop "$s"
+      ;;
+  esac
+}
+
+svc_restart() {
+  local s
+  case "$1" in
+    openvpn)
+      systemctl restart openvpn-server@server-udp || true
+      systemctl restart openvpn-server@server-tcp || true
+      ;;
+    openconnect)
+      systemctl restart ocserv
+      ;;
+    v2ray|xray)
+      systemctl restart xray
+      ;;
+    *)
+      s="$(service_name "$1")"
+      systemctl restart "$s"
+      ;;
+  esac
+}
+
+change_openvpn_ports() {
+  local udp="$1" tcp="$2"
+  is_port "$udp" || fail "Invalid OpenVPN UDP port: $udp"
+  is_port "$tcp" || fail "Invalid OpenVPN TCP port: $tcp"
+
+  # Allow current OpenVPN ports to be changed without false conflict.
+  local current_udp current_tcp
+  current_udp="$(awk '/^port /{print $2; exit}' /etc/openvpn/server/server-udp.conf 2>/dev/null || true)"
+  current_tcp="$(awk '/^port /{print $2; exit}' /etc/openvpn/server/server-tcp.conf 2>/dev/null || true)"
+
+  if [[ "$udp" != "$current_udp" ]] && port_in_use "$udp"; then fail "UDP port $udp already in use"; fi
+  if [[ "$tcp" != "$current_tcp" ]] && port_in_use "$tcp"; then fail "TCP port $tcp already in use"; fi
+
+  sed -i "s/^port .*/port ${udp}/" /etc/openvpn/server/server-udp.conf
+  sed -i "s/^port .*/port ${tcp}/" /etc/openvpn/server/server-tcp.conf
+
+  if [[ -f /usr/local/bin/ovpn-make-profile.sh ]]; then
+    sed -i "s/remote \${SERVER_ADDR} [0-9]\+ udp/remote \${SERVER_ADDR} ${udp} udp/g" /usr/local/bin/ovpn-make-profile.sh || true
+    sed -i "s/remote \${OVPN_HOST:-\$SERVER_ADDR} [0-9]\+ tcp-client/remote \${OVPN_HOST:-\$SERVER_ADDR} ${tcp} tcp-client/g" /usr/local/bin/ovpn-make-profile.sh || true
+  fi
+
+  iptables -C INPUT -p udp --dport "$udp" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$udp" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "$tcp" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$tcp" -j ACCEPT
+
+  svc_restart openvpn
+  echo "OpenVPN ports changed: UDP=$udp TCP=$tcp"
+}
+
+change_openconnect_port() {
+  local port="$1"
+  is_port "$port" || fail "Invalid OpenConnect port: $port"
+  local current
+  current="$(awk -F'= *' '/^tcp-port/{print $2; exit}' /etc/ocserv/ocserv.conf 2>/dev/null || true)"
+  if [[ "$port" != "$current" ]] && port_in_use "$port"; then fail "Port $port already in use"; fi
+
+  sed -i "s/^tcp-port = .*/tcp-port = ${port}/" /etc/ocserv/ocserv.conf
+  sed -i "s/^udp-port = .*/udp-port = ${port}/" /etc/ocserv/ocserv.conf
+  iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+  iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+  svc_restart openconnect
+  echo "OpenConnect port changed: $port"
+}
+
+change_v2ray_port() {
+  local port="$1"
+  is_port "$port" || fail "Invalid V2Ray/Xray port: $port"
+  local current=""
+  if [[ -f /etc/xray/config.json ]]; then
+    current="$(grep -m1 '"port"' /etc/xray/config.json | grep -oE '[0-9]+' | head -n1 || true)"
+  fi
+  if [[ "$port" != "$current" ]] && port_in_use "$port"; then fail "Port $port already in use"; fi
+
+  if [[ -f /etc/xray/config.json ]]; then
+    python3 - <<PY
 import json
-p=int('$port')
-path='/usr/local/etc/xray/config.json'
-with open(path) as f: data=json.load(f)
-if data.get('inbounds'): data['inbounds'][0]['port']=p
-with open(path,'w') as f: json.dump(data,f,indent=2)
+p='/etc/xray/config.json'
+port=int('${port}')
+with open(p) as f:
+    data=json.load(f)
+if 'inbounds' in data and data['inbounds']:
+    data['inbounds'][0]['port']=port
+with open(p,'w') as f:
+    json.dump(data,f,indent=2)
 PY
-        allow_tcp "$port"; set_conf V2_PORT "$port"; [[ -f "$PANEL_DIR/data/v2ray.env" ]] && sed -i "s/^V2_PORT=.*/V2_PORT=${port}/" "$PANEL_DIR/data/v2ray.env" || true; systemctl restart xray ;;
-      *) echo "Invalid protocol"; exit 2 ;;
+  else
+    fail "/etc/xray/config.json not found"
+  fi
+  iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+  svc_restart v2ray
+  echo "V2Ray/Xray port changed: $port"
+}
+
+install_protocol() {
+  local proto="$1"
+  shift || true
+  case "$proto" in
+    openvpn)
+      bash /root/vpn-installer/install-openvpn.sh "$@"
+      ;;
+    openconnect)
+      bash /root/vpn-installer/install-openconnect.sh "$@"
+      ;;
+    v2ray|xray)
+      bash /root/vpn-installer/install-v2ray.sh "$@"
+      ;;
+    *) fail "Unknown protocol: $proto" ;;
+  esac
+}
+
+case "$ACTION" in
+  start)
+    svc_start "$PROTO"
+    echo "Started $PROTO"
+    ;;
+  stop)
+    svc_stop "$PROTO"
+    echo "Stopped $PROTO"
+    ;;
+  restart)
+    svc_restart "$PROTO"
+    echo "Restarted $PROTO"
+    ;;
+  status)
+    case "$PROTO" in
+      openvpn)
+        systemctl is-active openvpn-server@server-udp || true
+        systemctl is-active openvpn-server@server-tcp || true
+        ;;
+      openconnect)
+        systemctl is-active ocserv || true
+        ;;
+      v2ray|xray)
+        systemctl is-active xray || true
+        ;;
+      *) fail "Unknown protocol: $PROTO" ;;
     esac
-    echo "$proto port changed" ;;
-  *) echo "Usage: vpn-control.sh {install|change-port|start|stop|restart|status|port-check} ..."; exit 2 ;;
+    ;;
+  port-check)
+    is_port "$PROTO" || fail "Invalid port: $PROTO"
+    if port_in_use "$PROTO"; then echo "USED"; exit 2; else echo "FREE"; fi
+    ;;
+  change-port)
+    case "$PROTO" in
+      openvpn) change_openvpn_ports "$PORT1" "$PORT2" ;;
+      openconnect) change_openconnect_port "$PORT1" ;;
+      v2ray|xray) change_v2ray_port "$PORT1" ;;
+      *) fail "Unknown protocol: $PROTO" ;;
+    esac
+    ;;
+  install)
+    install_protocol "$PROTO" "$PORT1" "$PORT2"
+    ;;
+  *)
+    cat >&2 <<USAGE
+Usage:
+  vpn-control.sh start openvpn|openconnect|v2ray
+  vpn-control.sh stop openvpn|openconnect|v2ray
+  vpn-control.sh restart openvpn|openconnect|v2ray
+  vpn-control.sh status openvpn|openconnect|v2ray
+  vpn-control.sh port-check PORT
+  vpn-control.sh change-port openvpn UDP_PORT TCP_PORT
+  vpn-control.sh change-port openconnect PORT
+  vpn-control.sh change-port v2ray PORT
+  vpn-control.sh install openvpn UDP_PORT TCP_PORT
+  vpn-control.sh install openconnect PORT
+  vpn-control.sh install v2ray PORT
+USAGE
+    exit 1
+    ;;
 esac
