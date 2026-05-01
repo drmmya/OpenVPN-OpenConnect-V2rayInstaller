@@ -1,0 +1,31 @@
+A-to-Z fixed version notes
+
+Static checks done before ZIP build:
+- bash -n passed for all root shell scripts.
+- php -l passed for all panel-admin PHP files.
+- php -l passed for generated OpenVPN/OpenConnect/V2Ray panel PHP blocks inside installers.
+
+Main fixes included:
+1. Panel install buttons run protocol installs as background jobs, so Apache/PHP request no longer dies with ERR_EMPTY_RESPONSE.
+2. Panel install logs are written to /var/log/vpn-panel-install-openvpn.log, /var/log/vpn-panel-install-openconnect.log, and /var/log/vpn-panel-install-v2ray.log.
+3. OpenVPN .ovpn profile generation now uses the actual selected/changed UDP and TCP ports, not the old defaults.
+4. OpenVPN profiles are regenerated after port changes and after main install writes final protocol config.
+5. main-installer no longer ignores missing panel files.
+6. Port inputs are validated and duplicate selected ports are rejected.
+7. OpenConnect no longer silently falls back to port 444. If the requested port is busy, install fails clearly.
+8. python3/iproute2/php-sqlite3 dependencies added where needed.
+9. Unified persistent firewall service added via /usr/local/bin/vpn-control.sh refresh-firewall and vpn-iptables.service.
+10. OpenVPN/OpenConnect/V2Ray firewall rules are refreshed after install and after port changes.
+11. Username validation added for VPN users: A-Z a-z 0-9 . _ - only, 3-32 characters.
+12. OpenConnect default VPN user is created during install.
+13. OpenConnect panel no longer stores/shows plaintext passwords in CSV; unblock requires password reset.
+14. Apache panel directory listing disabled with Options -Indexes.
+15. Panel PHP files are root-owned; only data/download directories are writable by www-data.
+16. V2Ray/Xray active-session command port handling fixed.
+
+After installing, verify:
+- sudo tail -n 100 /var/log/vpn-panel-install-openvpn.log
+- sudo tail -n 100 /var/log/vpn-panel-install-openconnect.log
+- sudo tail -n 100 /var/log/vpn-panel-install-v2ray.log
+- sudo cat /etc/vpn-protocols.conf
+- sudo grep -R '^remote ' /var/www/html/panel-admin/downloads/*.ovpn
