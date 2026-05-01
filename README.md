@@ -5,7 +5,7 @@ A modular all-in-one VPN installer for Ubuntu/Debian VPS. This project installs 
 GitHub main installer:
 
 ```bash
-https://github.com/drmmya/OpenVPN-OpenConnect-V2rayInstaller/blob/main/main-installer.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/drmmya/OpenVPN-OpenConnect-V2rayInstaller/main/main-installer.sh)
 ```
 
 ---
