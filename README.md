@@ -1,4 +1,4 @@
-# VPN PRO Admin Installer — fixed version
+# VPN PRO Admin Installer
 
 Run from the extracted folder on a clean Ubuntu/Debian VPS:
 
