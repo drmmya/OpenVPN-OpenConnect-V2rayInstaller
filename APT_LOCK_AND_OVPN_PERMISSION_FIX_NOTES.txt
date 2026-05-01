@@ -1,0 +1,7 @@
+A-to-Z Fix Notes
+
+1. Added apt/dpkg lock handler. Installer temporarily stops apt-daily/unattended-upgrades, waits for lock release, repairs dpkg, then installs packages. Auto-update timers are restored at script exit.
+2. Added panel install lock so only one protocol install runs at a time.
+3. Fixed OpenVPN panel user create/delete permission errors by running ovpn-user-manage through sudo and adding sudoers rules.
+4. Fixed ovpn profile creation with atomic temp file plus root:www-data 664 permissions and downloads directory 775.
+5. Fixed delete to remove .ovpn robustly and prevent intermittent Permission denied.
